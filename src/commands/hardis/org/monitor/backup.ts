@@ -38,6 +38,8 @@ The command exists in 2 modes: filtered(default & recommended) and full.
 
 Automatically skips metadatas from installed packages with namespace.
 
+If the filtered manifest contains more than 10000 metadata members, it is automatically chunked into multiple retrieve calls.
+
 You can remove more metadata types from backup, especially in case you have too many metadatas and that provokes a crash, using:
 
 - Manual update of \`manifest/package-skip-items.xml\` config file (then commit & push in the same branch)
@@ -134,7 +136,7 @@ In agent mode:
     "max-by-chunk": Flags.integer({
       char: "m",
       default: 3000,
-      description: 'If mode --full is activated, maximum number of metadatas in a package.xml chunk',
+      description: 'Maximum number of metadatas in a package.xml chunk when chunked retrieve is used',
     }),
     "exclude-namespaces": Flags.boolean({
       char: "e",
@@ -185,6 +187,7 @@ In agent mode:
 
   // Trigger notification(s) to MsTeams channel
   protected static triggerNotification = true;
+  private static readonly retrieveMaxItemsPerCall = 10000;
 
   protected diffFiles: any[] = [];
   protected diffFilesSimplified: any[] = [];
@@ -496,13 +499,27 @@ In agent mode:
       packageXmlToExtract = packageXmlFullFileWithoutNamespace;
     }
 
-    // Build packageXml chunks
     const packageElements = await parsePackageXmlFile(packageXmlToExtract);
 
     // Extract Data Cloud objects/fields (__dlm / __dll) so they are retrieved separately
     const dataCloudMetadataToRetrieve = await this.extractDataCloudMetadataFromElements(packageElements);
 
-    // Handle predefined chunks
+    await this.retrievePackageElementsInChunks(packageElements, flags);
+
+    // Retrieve Data Cloud objects/fields (__dlm / __dll) in a separate call after chunks
+    await this.handleDataCloudRetrieve(null, dataCloudMetadataToRetrieve, flags);
+  }
+
+  private async retrievePackageXmlInChunks(packageXmlFile: string, flags: any) {
+    const packageElements = await parsePackageXmlFile(packageXmlFile);
+    await this.retrievePackageElementsInChunks(packageElements, flags);
+  }
+
+  private async retrievePackageElementsInChunks(packageElements: any, flags: any) {
+    this.extractPackageXmlChunks = [];
+    this.currentPackage = {};
+    this.currentPackageLen = 0;
+
     const predefinedChunkTypes = [
       { types: ["CustomLabel"], memberMode: "*" },
       // { types: ["CustomObject", "Profile"] },
@@ -577,9 +594,6 @@ In agent mode:
       }
       await this.retrievePackageXml(packageXmlChunkFile, flags);
     }
-
-    // Retrieve Data Cloud objects/fields (__dlm / __dll) in a separate call after chunks
-    await this.handleDataCloudRetrieve(null, dataCloudMetadataToRetrieve, flags);
   }
 
   private manageAddCurrentPackageInChunks() {
@@ -603,7 +617,20 @@ In agent mode:
     });
 
     // Retrieve sfdx sources in local git repo
-    await this.retrievePackageXml(packageXmlBackUpItemsFile, flags);
+    const filteredManifestItems = await countPackageXmlItems(packageXmlBackUpItemsFile);
+    if (filteredManifestItems > MonitorBackup.retrieveMaxItemsPerCall) {
+      uxLog(
+        "warning",
+        this,
+        c.yellow(
+          `Filtered manifest contains ${filteredManifestItems} metadata members, which is above the ${MonitorBackup.retrieveMaxItemsPerCall} retrieve limit. Retrieving it in chunks.`
+        )
+      );
+      await this.retrievePackageXmlInChunks(packageXmlBackUpItemsFile, flags);
+    }
+    else {
+      await this.retrievePackageXml(packageXmlBackUpItemsFile, flags);
+    }
 
     // Retrieve Data Cloud objects/fields (__dlm / __dll) in a separate call
     await this.handleDataCloudRetrieve(packageXmlFullFile, null, flags);
